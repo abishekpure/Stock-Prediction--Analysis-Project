@@ -15,6 +15,9 @@ API_KEY = os.getenv("API_KEY")
 st.set_page_config(page_title="Real-Time Multi-Stock Dashboard", layout="wide")
 st.title("📈 Multi-Stock Real-Time Dashboard with ARIMA (Statsmodels Only)")
 
+from streamlit_autorefresh import st_autorefresh # type: ignore
+st_autorefresh(interval=60 * 1000, key="realtime_refresh")  
+
 if "symbols_text" not in st.session_state:
     st.session_state.symbols_text = " "
 
