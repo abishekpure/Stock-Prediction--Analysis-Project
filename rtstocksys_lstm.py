@@ -21,7 +21,7 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
 st.set_page_config(page_title="Real-Time Stock Forecast Dashboard", layout="wide")
-st.title("📈 Real-Time LSTM Stock Forecast Dashboard")
+st.title("Real-Time Stock Forecast System Dashboard")
 
 from streamlit_autorefresh import st_autorefresh # type: ignore
 st_autorefresh(interval=60 * 1000, key="realtime_refresh")
@@ -130,7 +130,7 @@ def lstm_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
 
     return np.array(forecast, dtype=np.float32)
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def fetch_historical_data(symbol: str, size: int = 4000):
     """Fetch historical hourly data from Twelve Data."""
     if not API_KEY:
