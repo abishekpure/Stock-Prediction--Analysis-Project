@@ -105,7 +105,8 @@ def lstm_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
     if len(prices) == 0:
         return np.array([0.0] * steps)
 
-    window_use = min(window, len(prices) - 1)
+    # ✅ Limit effective window to available data or 2000 max
+    window_use = min(window, len(prices) - 1, 2000)
     if window_use <= 0:
         return np.array([float(prices[-1])] * steps)
     
@@ -182,7 +183,9 @@ for symbol in symbols:
         df = pd.concat([df, pd.DataFrame({"datetime":[pd.Timestamp.now()], "close":[latest]})], ignore_index=True)
 
     st.session_state.stocks_data[symbol] = df
-    prices = df['close'].dropna().values.astype(np.float32)
+    max_points = min(2000, window * 2)   # keep double the lookback window for training context
+    prices = df['close'].dropna().values.astype(np.float32)[-max_points:]
+
 
     # Handle insufficient data
     if len(prices) <= window:
