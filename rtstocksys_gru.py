@@ -47,7 +47,7 @@ if "stocks_data" not in st.session_state: st.session_state.stocks_data = {}
 symbols_text = st.sidebar.text_input("Symbols (comma separated)", value=st.session_state.symbols_text)
 st.session_state.symbols_text = symbols_text
 
-window = st.sidebar.number_input("GRU Lookback Window (hours)", 20, 500, value=st.session_state.window)
+window = st.sidebar.number_input("GRU Lookback Window (hours)", 20, 2000, value=st.session_state.window)
 st.session_state.window = window
 
 future_steps = st.sidebar.number_input("Forecast Steps (hours)", 1, 24, value=st.session_state.future_steps)
@@ -95,6 +95,7 @@ def evaluate_model(y_true, y_pred):
         "Total Accuracy%": accuracy
     }
 
+@st.cache_resource(show_spinner=False)
 def train_gru(symbol: str, prices: np.ndarray, window: int, epochs: int = 8, batch_size: int = 32):
     """Train GRU quickly and compute accuracy metrics."""
     X, y, scaler = prep_data(prices, window)
@@ -103,9 +104,7 @@ def train_gru(symbol: str, prices: np.ndarray, window: int, epochs: int = 8, bat
 
     model = build_gru_model(window)
     es = EarlyStopping(monitor="loss", patience=2, restore_best_weights=True)
-    
-    with st.spinner(f" "):
-        model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0, callbacks=[es])
+    model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0, callbacks=[es])
 
     # Predict on training data for evaluation
     y_pred = model.predict(X, verbose=0)
@@ -131,7 +130,8 @@ def gru_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
     if len(prices) == 0:
         return np.array([0.0] * steps)
 
-    window_use = min(window, len(prices)-1)
+    # ✅ Limit effective window to available data or 2000 max
+    window_use = min(window, len(prices) - 1, 2000)
     if window_use <= 0:
         return np.array([float(prices[-1])] * steps)
 
@@ -157,7 +157,7 @@ def gru_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
 
     return np.array(forecast, dtype=np.float32)
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def fetch_historical_data(symbol: str, size: int = 4000):
     """Fetch historical hourly data from Twelve Data."""
     if not API_KEY:
@@ -208,7 +208,9 @@ for symbol in symbols:
         df = pd.concat([df, pd.DataFrame({"datetime":[pd.Timestamp.now()], "close":[latest]})], ignore_index=True)
 
     st.session_state.stocks_data[symbol] = df
-    prices = df['close'].dropna().values.astype(np.float32)
+    max_points = min(2000, window * 2)   # keep double the lookback window for training context
+    prices = df['close'].dropna().values.astype(np.float32)[-max_points:]
+
 
     # Handle insufficient data
     if len(prices) <= window:
