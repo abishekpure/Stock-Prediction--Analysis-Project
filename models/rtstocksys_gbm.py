@@ -52,45 +52,47 @@ def evaluate_model(y_true, y_pred):
     accuracy = 100 - mape
     return {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE%": mape, "Total Accuracy%": accuracy}
 
-# -------------------------
-# Gradient Boosting Training
-# -------------------------
 @st.cache_resource(show_spinner=False)
 def train_gbm(symbol: str, prices: np.ndarray, window: int, steps: int):
+    """Train GBM for direct multi-step forecasting (no recursion)"""
     if len(prices) <= window + steps:
         return None, None
 
+    # Prepare X and y
     X, y = [], []
     for i in range(window, len(prices) - steps + 1):
         X.append(prices[i-window:i])
-        y.append(prices[i:i+steps])
+        y.append(prices[i:i+steps])  # multi-output for all future steps
 
     X = np.array(X, dtype=np.float32)
     y = np.array(y, dtype=np.float32)
 
+    # Train one GBM per output step (multi-output approach)
     models = []
     for step in range(steps):
-        gbm = GradientBoostingRegressor(n_estimators=200, learning_rate=0.05, max_depth=3, random_state=SEED)
+        gbm = GradientBoostingRegressor(
+            n_estimators=300,
+            learning_rate=0.05,
+            max_depth=3,
+            random_state=SEED
+        )
         gbm.fit(X, y[:, step])
         models.append(gbm)
 
-    # Evaluate first step
+    # Evaluate first step (optional)
     y_pred_first = np.array([m.predict(X) for m in models[:1]]).T[:,0]
     metrics = evaluate_model(y[:,0], y_pred_first)
 
     return models, metrics
 
-# -------------------------
-# Multi-step forecast
-# -------------------------
+
 def gbm_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
-    """Multi-step GBM forecast with recursive updates to ensure realistic trajectories."""
+    """Direct multi-step GBM forecast (no recursion)"""
     if len(prices) <= window:
         return np.array([float(prices[-1])] * steps)
 
-    window_use = min(window, len(prices)-1)
-    if window_use <= 0:
-        return np.array([float(prices[-1])] * steps)
+    window_use = min(window, len(prices))
+    last_window = prices[-window_use:].reshape(1, -1)  # only use actual last window
 
     models, metrics = train_gbm(symbol, prices, window_use, steps)
     if models is None:
@@ -98,17 +100,10 @@ def gbm_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
 
     st.session_state.metrics[symbol] = metrics
 
-    last_seq = prices[-window_use:].reshape(1, -1)  # initial window
-    forecast = []
-
-    for step in range(steps):
-        pred = models[step].predict(last_seq)
-        forecast.append(pred[0])
-        # Update last_seq recursively with predicted value
-        last_seq = np.append(last_seq[:,1:], pred).reshape(1, -1)
+    # Predict all steps in one go
+    forecast = [model.predict(last_window)[0] for model in models]
 
     return np.array(forecast, dtype=np.float32)
-
 # -------------------------
 # Fetch Historical Data
 # -------------------------
