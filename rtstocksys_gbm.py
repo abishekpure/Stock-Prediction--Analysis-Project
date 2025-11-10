@@ -84,10 +84,11 @@ def train_gbm(symbol: str, prices: np.ndarray, window: int, steps: int):
 # Multi-step forecast
 # -------------------------
 def gbm_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
+    """Multi-step GBM forecast with recursive updates to ensure realistic trajectories."""
     if len(prices) <= window:
         return np.array([float(prices[-1])] * steps)
 
-    window_use = min(window, len(prices)-steps)
+    window_use = min(window, len(prices)-1)
     if window_use <= 0:
         return np.array([float(prices[-1])] * steps)
 
@@ -97,11 +98,13 @@ def gbm_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
 
     st.session_state.metrics[symbol] = metrics
 
-    last_seq = prices[-window_use:].reshape(1, -1)
+    last_seq = prices[-window_use:].reshape(1, -1)  # initial window
     forecast = []
+
     for step in range(steps):
         pred = models[step].predict(last_seq)
         forecast.append(pred[0])
+        # Update last_seq recursively with predicted value
         last_seq = np.append(last_seq[:,1:], pred).reshape(1, -1)
 
     return np.array(forecast, dtype=np.float32)
