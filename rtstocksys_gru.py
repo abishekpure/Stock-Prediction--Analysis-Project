@@ -80,50 +80,62 @@ def evaluate_model(y_true, y_pred):
 
 
 @st.cache_resource(show_spinner=False)
-def train_gru(symbol: str, prices: np.ndarray, window: int, epochs: int = 8, batch_size: int = 32):
-    X, y, scaler = prep_data(prices, window)
-    if X.shape[0] == 0:
+def train_gru(symbol: str, prices: np.ndarray, window: int, steps: int, epochs: int = 10, batch_size: int = 32):
+    """Train GRU model for multi-step forecasting"""
+    if len(prices) <= window + steps:
         return None, None, None
 
-    model = build_gru_model(window)
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(prices.reshape(-1, 1))
+
+    X, y = [], []
+    for i in range(window, len(scaled) - steps):
+        X.append(scaled[i - window:i])
+        y.append(scaled[i:i + steps].flatten())  # Predict next 'steps' values
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
+
+    model = Sequential([
+        GRU(64, return_sequences=False, input_shape=(window, 1)),
+        Dense(steps)
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.003), loss='mse')
+
     es = EarlyStopping(monitor="loss", patience=2, restore_best_weights=True)
     model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0, callbacks=[es])
 
+    # Evaluate using only the first predicted value vs actual
     y_pred = model.predict(X, verbose=0)
-    y_true_inv = scaler.inverse_transform(y)
-    y_pred_inv = scaler.inverse_transform(y_pred)
+    y_true_inv = scaler.inverse_transform(y[:, :1])
+    y_pred_inv = scaler.inverse_transform(y_pred[:, :1])
     metrics = evaluate_model(y_true_inv.flatten(), y_pred_inv.flatten())
 
     return model, scaler, metrics
 
 
 def gru_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
+    """Multi-step GRU forecast"""
     if len(prices) == 0:
         return np.array([0.0] * steps)
 
-    window_use = min(window, len(prices) - 1, 2000)
+    window_use = min(window, len(prices) - steps, 2000)
     if window_use <= 0:
         return np.array([float(prices[-1])] * steps)
-    
-    model, scaler, metrics = train_gru(symbol, prices, window_use)
+
+    model, scaler, metrics = train_gru(symbol, prices, window_use, steps)
     if model is None:
         return np.array([float(prices[-1])] * steps)
 
     st.session_state.metrics = st.session_state.get("metrics", {})
     st.session_state.metrics[symbol] = metrics
 
-    last_seq = prices[-window_use:].astype(np.float32)
-    forecast = []
+    last_seq = prices[-window_use:].reshape(-1, 1).astype(np.float32)
+    scaled_seq = scaler.transform(last_seq)
+    pred_scaled = model.predict(scaled_seq.reshape(1, window_use, 1), verbose=0)
+    forecast = scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
 
-    for _ in range(steps):
-        scaled = scaler.transform(last_seq.reshape(-1, 1))
-        pred = model.predict(scaled.reshape(1, window_use, 1), verbose=0)
-        pred_val = float(scaler.inverse_transform(pred)[0][0])
-        forecast.append(pred_val)
-        last_seq = np.append(last_seq[1:], pred_val)
-
-    return np.array(forecast, dtype=np.float32)
-
+    return forecast.astype(np.float32)
 
 @st.cache_resource(show_spinner=False)
 def fetch_historical_data(symbol: str, size: int = 4000):
