@@ -13,30 +13,19 @@ from tensorflow.keras.layers import GRU, Dense # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping # type: ignore
 from sklearn.preprocessing import MinMaxScaler # type: ignore
 
-# -------------------------
-# Determinism
-# -------------------------
 SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-# -------------------------
-# Load environment
-# -------------------------
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
-# -------------------------
-# Streamlit page config
-# -------------------------
-st.set_page_config(page_title="Real-Time Stock Forecast Dashboard", layout="wide")
-st.title("Real-Time Stock Forecast System Dashboard")
+st.set_page_config(page_title="Real-Time Stock Forecast Dashboard (GRU)", layout="wide")
+st.title("📈 Real-Time Stock Forecast System — GRU Version")
 
 from streamlit_autorefresh import st_autorefresh # type: ignore
-st_autorefresh(interval=60 * 1000, key="realtime_refresh")  
-# -------------------------
-# Initialize session state safely
-# -------------------------
+st_autorefresh(interval=60 * 1000, key="realtime_refresh")
+
 if "symbols_text" not in st.session_state: st.session_state.symbols_text = " "
 if "window" not in st.session_state: st.session_state.window = 60
 if "future_steps" not in st.session_state: st.session_state.future_steps = 5
@@ -53,8 +42,8 @@ st.session_state.window = window
 future_steps = st.sidebar.number_input("Forecast Steps (hours)", 1, 24, value=st.session_state.future_steps)
 st.session_state.future_steps = future_steps
 
+
 def prep_data(prices: np.ndarray, window: int):
-    """Prepare X, y and scaler for GRU."""
     if len(prices) <= window:
         return np.empty((0, window, 1)), np.empty((0, 1)), None
 
@@ -68,98 +57,76 @@ def prep_data(prices: np.ndarray, window: int):
     y = np.array(y, dtype=np.float32).reshape(-1, 1)
     return X, y, scaler
 
+
 def build_gru_model(window: int):
-    """Lightweight & fast GRU model."""
+    """Lightweight GRU model"""
     model = Sequential([
-        GRU(16, return_sequences=False, input_shape=(window, 1)),  # smaller size
+        GRU(32, return_sequences=False, input_shape=(window, 1)),
         Dense(1)
     ])
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.005), loss='mse')
     return model
 
+
 def evaluate_model(y_true, y_pred):
-    """Compute performance metrics."""
     from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score # type: ignore
     mse = mean_squared_error(y_true, y_pred)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(y_true, y_pred)
     r2 = r2_score(y_true, y_pred)
-    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100  # avoid div by zero
+    mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
     accuracy = 100 - mape
-    return {
-        "MSE": mse,
-        "RMSE": rmse,
-        "MAE": mae,
-        "R2": r2,
-        "MAPE%": mape,
-        "Total Accuracy%": accuracy
-    }
+    return {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE%": mape, "Total Accuracy%": accuracy}
+
 
 @st.cache_resource(show_spinner=False)
 def train_gru(symbol: str, prices: np.ndarray, window: int, epochs: int = 8, batch_size: int = 32):
-    """Train GRU quickly and compute accuracy metrics."""
     X, y, scaler = prep_data(prices, window)
     if X.shape[0] == 0:
-        return False
+        return None, None, None
 
     model = build_gru_model(window)
     es = EarlyStopping(monitor="loss", patience=2, restore_best_weights=True)
     model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0, callbacks=[es])
 
-    # Predict on training data for evaluation
     y_pred = model.predict(X, verbose=0)
-    y_true = y
-    y_true_inv = scaler.inverse_transform(y_true)
+    y_true_inv = scaler.inverse_transform(y)
     y_pred_inv = scaler.inverse_transform(y_pred)
     metrics = evaluate_model(y_true_inv.flatten(), y_pred_inv.flatten())
 
-    st.session_state.gru_models[symbol] = model
-    st.session_state.scalers[symbol] = scaler
-    st.session_state.metrics = st.session_state.get("metrics", {})
-    st.session_state.metrics[symbol] = metrics
+    return model, scaler, metrics
 
-    # Display metrics on dashboard
-    st.success(f"Success")
-    #st.write("### Performance Metrics")
-    #st.dataframe(pd.DataFrame(metrics, index=[0]).T)
-
-    return True
 
 def gru_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
-    """Generate forecast using trained GRU model."""
     if len(prices) == 0:
         return np.array([0.0] * steps)
 
-    # ✅ Limit effective window to available data or 2000 max
     window_use = min(window, len(prices) - 1, 2000)
     if window_use <= 0:
         return np.array([float(prices[-1])] * steps)
+    
+    model, scaler, metrics = train_gru(symbol, prices, window_use)
+    if model is None:
+        return np.array([float(prices[-1])] * steps)
 
-    # Train if missing
-    if symbol not in st.session_state.gru_models:
-        trained = train_gru(symbol, prices, window_use)
-        if not trained:
-            return np.array([float(prices[-1])] * steps)
-
-    model = st.session_state.gru_models[symbol]
-    scaler = st.session_state.scalers[symbol]
+    st.session_state.metrics = st.session_state.get("metrics", {})
+    st.session_state.metrics[symbol] = metrics
 
     last_seq = prices[-window_use:].astype(np.float32)
     forecast = []
 
-    with st.spinner(f"Forecasting next {steps} hours for {symbol}..."):
-        for _ in range(steps):
-            scaled = scaler.transform(last_seq.reshape(-1, 1))
-            pred = model.predict(scaled.reshape(1, window_use, 1), verbose=0)
-            pred_val = float(scaler.inverse_transform(pred)[0][0])
-            forecast.append(pred_val)
-            last_seq = np.append(last_seq[1:], pred_val)
+    for _ in range(steps):
+        scaled = scaler.transform(last_seq.reshape(-1, 1))
+        pred = model.predict(scaled.reshape(1, window_use, 1), verbose=0)
+        pred_val = float(scaler.inverse_transform(pred)[0][0])
+        forecast.append(pred_val)
+        last_seq = np.append(last_seq[1:], pred_val)
 
     return np.array(forecast, dtype=np.float32)
 
+
 @st.cache_resource(show_spinner=False)
 def fetch_historical_data(symbol: str, size: int = 4000):
-    """Fetch historical hourly data from Twelve Data."""
     if not API_KEY:
         return pd.DataFrame(columns=["datetime", "close"])
     try:
@@ -175,8 +142,8 @@ def fetch_historical_data(symbol: str, size: int = 4000):
     except Exception:
         return pd.DataFrame(columns=["datetime", "close"])
 
+
 def fetch_price(symbol: str):
-    """Fetch latest price."""
     if not API_KEY:
         return None
     try:
@@ -184,7 +151,11 @@ def fetch_price(symbol: str):
         return float(res.get("price", None)) if res.get("price", None) is not None else None
     except Exception:
         return None
-    
+
+
+# -------------------------
+# Main Execution
+# -------------------------
 if not API_KEY:
     st.error("API_KEY not found in .env file.")
     st.stop()
@@ -202,17 +173,14 @@ for symbol in symbols:
         st.error(f"No historical data for {symbol}. Check API key, symbol spelling, or plan limits.")
         continue
 
-    # Append latest price if needed
     latest = fetch_price(symbol)
     if latest is not None and df["datetime"].iloc[-1] < pd.Timestamp.now():
         df = pd.concat([df, pd.DataFrame({"datetime":[pd.Timestamp.now()], "close":[latest]})], ignore_index=True)
 
     st.session_state.stocks_data[symbol] = df
-    max_points = min(2000, window * 2)   # keep double the lookback window for training context
+    max_points = min(2000, window * 2)
     prices = df['close'].dropna().values.astype(np.float32)[-max_points:]
 
-
-    # Handle insufficient data
     if len(prices) <= window:
         st.warning(f"Not enough data for {symbol} to train GRU. Showing last prices only.")
         flat_forecast = np.array([float(prices[-1])] * future_steps) if len(prices) > 0 else np.array([0.0]*future_steps)
@@ -223,14 +191,10 @@ for symbol in symbols:
         fig.add_trace(go.Scatter(x=plot_df["datetime"], y=plot_df["close"], mode="lines", name=f"{symbol} Price"))
         fig.add_trace(go.Scatter(x=future_time, y=flat_forecast, mode="lines", name="Flat Forecast", line=dict(dash="dash")))
         st.plotly_chart(fig, use_container_width=True)
-        st.write(f"**Latest Price ({symbol}):** {prices[-1]:.2f}" if len(prices)>0 else "No price data")
-        st.write(f"**Next {future_steps}-hour Forecast:** {flat_forecast}")
         continue
 
-    # Generate forecast
     forecast = gru_forecast(symbol, prices, window, future_steps)
 
-    # Plot last 300 points + forecast
     plot_df = df.tail(300)
     future_time = pd.date_range(plot_df["datetime"].iloc[-1], periods=future_steps+1, freq="H")[1:]
 
@@ -244,12 +208,12 @@ for symbol in symbols:
     st.plotly_chart(fig, use_container_width=True)
     st.write(f"**Latest Price ({symbol}):** {prices[-1]:.2f}")
     st.write(f"**Next {future_steps}-hour Forecast:** {np.round(forecast, 2)}")
-    
+
     if "metrics" in st.session_state and symbol in st.session_state.metrics:
-     accuracy = st.session_state.metrics[symbol].get("Total Accuracy%", None)
-     if accuracy is not None:
-        st.write(f"**Accuracy:** {accuracy:.2f}%")
-     else:
-        st.write("**Accuracy:** Not available")
+        accuracy = st.session_state.metrics[symbol].get("Total Accuracy%", None)
+        if accuracy is not None:
+            st.write(f"**Accuracy:** {accuracy:.2f}%")
+        else:
+            st.write("**Accuracy:** Not available")
     else:
-     st.write("**Accuracy:** Not available")
+        st.write("**Accuracy:** Not available")
