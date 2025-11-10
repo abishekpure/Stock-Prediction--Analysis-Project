@@ -21,7 +21,7 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
 st.set_page_config(page_title="Real-Time Stock Forecast Dashboard (GRU)", layout="wide")
-st.title("📈 Real-Time Stock Forecast System — GRU Version")
+st.title("Real-Time Stock Forecast System Dashboard")
 
 from streamlit_autorefresh import st_autorefresh # type: ignore
 st_autorefresh(interval=60 * 1000, key="realtime_refresh")
