@@ -21,7 +21,7 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
 st.set_page_config(page_title="Real-Time Stock Forecast Dashboard (GRU)", layout="wide")
-st.title("Real-Time Stock Forecast System Dashboard")
+st.title("📈 Real-Time Stock Forecast System — GRU Version")
 
 from streamlit_autorefresh import st_autorefresh # type: ignore
 st_autorefresh(interval=60 * 1000, key="realtime_refresh")
@@ -136,6 +136,8 @@ def gru_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
     forecast = scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
 
     return forecast.astype(np.float32)
+
+
 
 @st.cache_resource(show_spinner=False)
 def fetch_historical_data(symbol: str, size: int = 4000):
