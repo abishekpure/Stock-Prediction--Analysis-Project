@@ -17,7 +17,7 @@ load_dotenv()
 API_KEY = os.getenv("API_KEY")
 
 st.set_page_config(page_title="Real-Time Stock Forecast Dashboard (GBM)", layout="wide")
-st.title("📈 Real-Time Stock Forecast System — Gradient Boosting Version")
+st.title("Real-Time Stock Forecast System Dashboard")
 
 from streamlit_autorefresh import st_autorefresh # type: ignore
 st_autorefresh(interval=60 * 1000, key="realtime_refresh")
