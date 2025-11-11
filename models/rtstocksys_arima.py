@@ -3,180 +3,221 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
-from sklearn.metrics import mean_absolute_error # type: ignore
-from statsmodels.tsa.arima.model import ARIMA # type: ignore
-import plotly.graph_objects as go # type: ignore
+import plotly.graph_objects as go  # type: ignore
+import json
+from io import StringIO
+
+from statsmodels.tsa.arima.model import ARIMA  # type: ignore
+from google.cloud import bigquery
+
+# -------------------------
+# Initialization
+# -------------------------
+SEED = 42
+np.random.seed(SEED)
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
+FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
+BQ_SA_FILE = "rapid-access-435612-b8-af4746783507.json"
+BQ_PROJECT = os.getenv("BQ_PROJECT")
+BQ_DATASET = os.getenv("BQ_DATASET")
+BQ_TABLE = os.getenv("BQ_TABLE")
 
-st.set_page_config(page_title="Real-Time Multi-Stock Dashboard", layout="wide")
-st.title("📈 Multi-Stock Real-Time Dashboard with ARIMA (Statsmodels Only)")
+st.set_page_config(page_title="Real-Time Stock Forecast Dashboard (ARIMA)", layout="wide")
+st.title("📈 Real-Time Stock Forecast System Dashboard")
 
 from streamlit_autorefresh import st_autorefresh # type: ignore
-st_autorefresh(interval=60 * 1000, key="realtime_refresh")  
+st_autorefresh(interval=60 * 1000, key="realtime_refresh")
 
-if "symbols_text" not in st.session_state:
-    st.session_state.symbols_text = " "
+# -------------------------
+# Session defaults
+# -------------------------
+if "symbols_text" not in st.session_state: st.session_state.symbols_text = ""
+if "start_date" not in st.session_state: st.session_state.start_date = (datetime.now() - timedelta(days=30)).date()
+if "future_steps" not in st.session_state: st.session_state.future_steps = 5
+if "stocks_data" not in st.session_state: st.session_state.stocks_data = {}
+if "submitted" not in st.session_state: st.session_state.submitted = False
+if "news_fetched" not in st.session_state: st.session_state.news_fetched = False
+if "metrics" not in st.session_state: st.session_state.metrics = {}
 
-if "window" not in st.session_state:
-    st.session_state.window = 300
-
-if "future_steps" not in st.session_state:
-    st.session_state.future_steps = 5
-
-if "use_ma" not in st.session_state:
-    st.session_state.use_ma = False
-
-symbols_text = st.sidebar.text_input(
-    "Symbols (comma separated)", 
-    value=st.session_state.symbols_text
-)
+# -------------------------
+# Sidebar inputs
+# -------------------------
+symbols_text = st.sidebar.text_input("Symbols (comma separated)", value=st.session_state.symbols_text)
 st.session_state.symbols_text = symbols_text
 
-window = st.sidebar.number_input(
-    "ARIMA Window Size", 30, 1700, 
-    value=st.session_state.window
-)
-st.session_state.window = window
+start_date = st.sidebar.date_input("Start Date", value=st.session_state.start_date)
+st.session_state.start_date = start_date
 
-future_steps = st.sidebar.number_input(
-    "Forecast Steps (hours)", 1, 10,
-    value=st.session_state.future_steps
-)
+future_steps = st.sidebar.number_input("Forecast Steps (hours)", 1, 24, value=st.session_state.future_steps)
 st.session_state.future_steps = future_steps
 
-use_ma = st.sidebar.checkbox(
-    "Show Moving Averages (SMA & EMA)", 
-    value=st.session_state.use_ma
-)
-st.session_state.use_ma = use_ma
+submit = st.sidebar.button("Submit")
+if submit:
+    st.session_state.submitted = True
 
-
-def safe_rmse(y_true, y_pred):
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    if y_true.size == 0 or y_pred.size == 0:
-        return 0.0
-    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-
-def direction_accuracy(test, forecast, threshold=0.2):
-    test_diff = np.diff(test)
-    forecast_diff = np.diff(forecast)
-    test_dir = np.sign(np.where(np.abs(test_diff) < threshold, 0, test_diff))
-    forecast_dir = np.sign(np.where(np.abs(forecast_diff) < threshold, 0, forecast_diff))
-    matches = np.sum(test_dir == forecast_dir)
-    return float(matches) / len(test_dir) if len(test_dir) > 0 else 0.0
-
-def improved_total_accuracy(actual, forecast):
-    actual = np.asarray(actual, dtype=float)
-    forecast = np.asarray(forecast, dtype=float)
-    
-    dir_score = direction_accuracy(actual, forecast)
-    
-    mae = mean_absolute_error(actual, forecast)
-    rmse = safe_rmse(actual, forecast)
-    avg_price = np.mean(actual)
-    
-    mae_score = max(0, 1 - mae / avg_price)
-    rmse_score = max(0, 1 - rmse / avg_price)
-    price_score = 0.5 * mae_score + 0.5 * rmse_score
-
-    vol = np.std(np.diff(actual))
-    forecast_vol = np.std(np.diff(forecast))
-    vol_ratio = forecast_vol / (vol + 1e-9)
-    vol_penalty = max(0, 1 - abs(vol_ratio - 1))
-
-    final_score = (0.4 * dir_score + 0.4 * price_score + 0.2 * vol_penalty) * 100
-    return final_score
-
-@st.cache_data
-def fetch_history(symbol: str, size: int = 4000) -> pd.DataFrame:
-    """Fetch historical hourly data from Twelve Data"""
+# -------------------------
+# Helper functions
+# -------------------------
+def fetch_finnhub_news(symbol: str):
     try:
-        resp = requests.get(
+        to_date = datetime.now().strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={to_date}&token={FINNHUB_TOKEN}"
+        res = requests.get(url)
+        if res.status_code != 200:
+            return []
+        data = res.json()
+        news_entries = []
+        for item in data[:10]:
+            news_entries.append({
+                "symbol": symbol,
+                "title": item.get("headline", "N/A"),
+                "source": item.get("source", "Unknown"),
+                "published_at_str": datetime.fromtimestamp(item.get("datetime")).strftime("%Y-%m-%d %H:%M:%S"),
+                "summary": item.get("summary", ""),
+                "url": item.get("url", ""),
+                "image": item.get("image", "")
+            })
+        return news_entries
+    except Exception:
+        return []
+
+def write_news_to_bq_json(news_entries):
+    if not news_entries:
+        return
+    client = bigquery.Client.from_service_account_json(BQ_SA_FILE, project=BQ_PROJECT)
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    json_lines = [json.dumps(entry, default=str) for entry in news_entries]
+    file_obj = StringIO("\n".join(json_lines))
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        autodetect=True
+    )
+    load_job = client.load_table_from_file(file_obj, table_id, job_config=job_config)
+    load_job.result()
+
+@st.cache_resource(show_spinner=False)
+def fetch_historical_data(symbol: str, size: int = 4000):
+    if not API_KEY:
+        return pd.DataFrame(columns=["datetime", "close"])
+    try:
+        res = requests.get(
             f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=1h&outputsize={size}&apikey={API_KEY}"
         ).json()
-        if "values" not in resp:
+        if "values" not in res:
             return pd.DataFrame(columns=["datetime", "close"])
-        df = pd.DataFrame(resp["values"])
+        df = pd.DataFrame(res["values"])
         df["datetime"] = pd.to_datetime(df["datetime"])
-        df["close"] = pd.to_numeric(df["close"])
-        return df.sort_values("datetime")
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        return df.sort_values("datetime").reset_index(drop=True)
     except Exception:
         return pd.DataFrame(columns=["datetime", "close"])
 
-def arima_forecast(prices, window, steps):
-    n = len(prices)
-    if n < window + steps:
-        return np.array([prices[-1]]*steps)
-    train = prices[-window:]
+def fetch_price(symbol: str):
+    if not API_KEY:
+        return None
     try:
-        model = ARIMA(train, order=(5,1,0)).fit()
-        forecast = model.forecast(steps=steps)
-        return np.asarray(forecast).astype(float)
-    except Exception:
-        return np.array([train[-1]]*steps)
-
-def fetch_price(symbol):
-    """Fetch latest price (not cached)"""
-    try:
-        resp = requests.get(f"https://api.twelvedata.com/price?symbol={symbol}&apikey={API_KEY}").json()
-        return float(resp["price"]) if "price" in resp else None
+        res = requests.get(f"https://api.twelvedata.com/price?symbol={symbol}&apikey={API_KEY}").json()
+        return float(res.get("price", None)) if res.get("price", None) is not None else None
     except Exception:
         return None
 
+# -------------------------
+# ARIMA Forecast Function
+# -------------------------
+@st.cache_resource(show_spinner=False)
+def arima_forecast(symbol: str, prices: np.ndarray, steps: int = 5, order=(5, 1, 0)):
+    if len(prices) < 10:
+        return np.array([float(prices[-1])] * steps if len(prices) > 0 else [0.0] * steps)
+    try:
+        model = ARIMA(prices, order=order)
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=steps)
+
+        y_true = prices[-steps:] if len(prices) >= steps else prices
+        y_pred = forecast[:len(y_true)]
+        mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-8))) * 100
+        accuracy = 100 - mape
+
+        st.session_state.metrics[symbol] = {"Total Accuracy%": accuracy}
+        return np.array(forecast, dtype=np.float32)
+    except Exception:
+        return np.array([float(prices[-1])] * steps)
+
+# -------------------------
+# Main Execution
+# -------------------------
+if not API_KEY:
+    st.error("API_KEY not found in .env file.")
+    st.stop()
+if not FINNHUB_TOKEN:
+    st.error("FINNHUB_TOKEN not found in .env file.")
+    st.stop()
 
 symbols = [s.strip().upper() for s in st.session_state.symbols_text.split(",") if s.strip()]
+if not symbols:
+    st.info("Enter at least one ticker symbol.")
+    st.stop()
 
-if "stocks_data" not in st.session_state:
-    st.session_state.stocks_data = {}
+if not st.session_state.submitted:
+    st.info("Set a start date and press Submit to fetch and forecast data.")
+    st.stop()
 
+# -------------------------
+# Fetch & store news
+# -------------------------
+if not st.session_state.news_fetched:
+    with st.spinner("Fetching and storing company news in BigQuery..."):
+        for sym in symbols:
+            news_data = fetch_finnhub_news(sym)
+            if news_data:
+                write_news_to_bq_json(news_data)
+    st.session_state.news_fetched = True
+
+# -------------------------
+# Render charts
+# -------------------------
 for symbol in symbols:
-    df = fetch_history(symbol)
+    st.header(symbol)
+    df = fetch_historical_data(symbol)
     if df.empty:
-        st.warning(f"No historical data available for {symbol}")
+        st.error(f"No historical data for {symbol}")
         continue
 
+    # Filter based on start date
+    df = df[df["datetime"].dt.date >= start_date]
+
     latest = fetch_price(symbol)
-    if latest is not None and (len(df) == 0 or df["datetime"].iloc[-1] < datetime.now()):
-        df = pd.concat([df, pd.DataFrame({"datetime":[datetime.now()], "close":[latest]})], ignore_index=True)
+    if latest is not None and df["datetime"].iloc[-1] < pd.Timestamp.now():
+        df = pd.concat([df, pd.DataFrame({"datetime":[pd.Timestamp.now()], "close":[latest]})], ignore_index=True)
 
     st.session_state.stocks_data[symbol] = df
-    prices = df['close'].dropna().values
-    forecast = arima_forecast(prices, window, future_steps)
 
-    plot_df = df.tail(300).dropna(subset=["datetime", "close"])
-    future_time = pd.date_range(plot_df["datetime"].iloc[-1], periods=future_steps+1, freq="H")[1:]
-    future_time = future_time[:len(forecast)]
+    prices = df['close'].dropna().values.astype(np.float32)
+    if len(prices) == 0:
+        st.warning(f"No price data for {symbol}.")
+        continue
+
+    forecast = arima_forecast(symbol, prices, steps=future_steps)
+    future_time = pd.date_range(df["datetime"].iloc[-1], periods=future_steps + 1, freq="H")[1:]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=plot_df["datetime"], y=plot_df["close"], mode="lines", name=f"{symbol} Price", line=dict(width=2,color="blue"),
-        hovertemplate="%{y:.2f} USD<br>%{x|%Y-%m-%d %H:%M}"
-    ))
-    fig.add_trace(go.Scatter(
-        x=future_time, y=forecast, mode="lines", name="ARIMA Forecast", line=dict(width=2,dash="dash",color="red"),
-        hovertemplate="%{y:.2f} USD<br>%{x|%Y-%m-%d %H:%M}"
-    ))
+    fig.add_trace(go.Scatter(x=df["datetime"], y=df["close"], mode="lines",
+                             name=f"{symbol} Price", line=dict(width=2, color="green")))
+    fig.add_trace(go.Scatter(x=future_time, y=forecast, mode="lines",
+                             name="ARIMA Forecast", line=dict(width=2, dash="dash", color="red")))
+    fig.update_layout(title=f"{symbol} — Price & ARIMA Forecast", hovermode="x unified", height=450)
 
-    if use_ma and len(plot_df) >= 20:
-        plot_df["SMA"] = plot_df["close"].rolling(window=20).mean()
-        plot_df["EMA"] = plot_df["close"].ewm(span=20, adjust=False).mean()
-        fig.add_trace(go.Scatter(x=plot_df["datetime"], y=plot_df["SMA"], mode="lines", name="SMA(20)", line=dict(width=2,color="orange")))
-        fig.add_trace(go.Scatter(x=plot_df["datetime"], y=plot_df["EMA"], mode="lines", name="EMA(20)", line=dict(width=2,color="green")))
-
-    fig.update_layout(title=f"{symbol} - Real-Time Price & ARIMA Forecast", hovermode="x unified", height=500,
-                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-    
     st.plotly_chart(fig, use_container_width=True)
-    st.write(f"**Latest Price ({symbol}):** {df['close'].iloc[-1]:.2f}")
-    st.write(f"**Next {future_steps}-hour Forecast:** {forecast}")
+    st.write(f"**Latest Price ({symbol}):** {prices[-1]:.2f}")
+    st.write(f"**Next {future_steps}-hour Forecast:** {np.round(forecast, 2)}")
 
-    actual_for_acc = df['close'].tail(len(forecast)).values
-    if len(actual_for_acc) < len(forecast):
-        actual_for_acc = np.pad(actual_for_acc, (len(forecast)-len(actual_for_acc),0), 'edge')
-    total_acc = improved_total_accuracy(actual_for_acc, forecast)
-    st.write(f"**Total Model Accuracy:** {total_acc:.2f}%")
+    if symbol in st.session_state.metrics:
+        acc = st.session_state.metrics[symbol].get("Total Accuracy%", None)
+        if acc is not None:
+            st.write(f"**Accuracy:** {acc:.2f}%")
