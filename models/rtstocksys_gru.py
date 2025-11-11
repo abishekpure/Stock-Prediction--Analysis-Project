@@ -3,22 +3,36 @@ import streamlit as st
 import pandas as pd
 import requests
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import plotly.graph_objects as go # type: ignore
+import json
+from io import StringIO
 
 import tensorflow as tf # type: ignore
 from tensorflow.keras.models import Sequential # type: ignore
 from tensorflow.keras.layers import GRU, Dense # type: ignore
 from tensorflow.keras.callbacks import EarlyStopping # type: ignore
-from sklearn.preprocessing import MinMaxScaler # type: ignore
+from sklearn.preprocessing import MinMaxScaler
 
+from google.cloud import bigquery
+
+# -------------------------
+# Seeds & Env
+# -------------------------
 SEED = 42
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
 load_dotenv()
 API_KEY = os.getenv("API_KEY")
+FINNHUB_TOKEN = os.getenv("FINNHUB_TOKEN")
+
+# BigQuery config
+BQ_SA_FILE = "rapid-access-435612-b8-af4746783507.json"
+BQ_PROJECT = os.getenv("BQ_PROJECT")
+BQ_DATASET = os.getenv("BQ_DATASET")
+BQ_TABLE = os.getenv("BQ_TABLE")
 
 st.set_page_config(page_title="Real-Time Stock Forecast Dashboard (GRU)", layout="wide")
 st.title("Real-Time Stock Forecast System Dashboard")
@@ -26,13 +40,21 @@ st.title("Real-Time Stock Forecast System Dashboard")
 from streamlit_autorefresh import st_autorefresh # type: ignore
 st_autorefresh(interval=60 * 1000, key="realtime_refresh")
 
+# -------------------------
+# Session defaults
+# -------------------------
 if "symbols_text" not in st.session_state: st.session_state.symbols_text = " "
 if "window" not in st.session_state: st.session_state.window = 60
 if "future_steps" not in st.session_state: st.session_state.future_steps = 5
 if "gru_models" not in st.session_state: st.session_state.gru_models = {}
 if "scalers" not in st.session_state: st.session_state.scalers = {}
 if "stocks_data" not in st.session_state: st.session_state.stocks_data = {}
+if "submitted" not in st.session_state: st.session_state.submitted = False
+if "news_fetched" not in st.session_state: st.session_state.news_fetched = False
 
+# -------------------------
+# Sidebar inputs
+# -------------------------
 symbols_text = st.sidebar.text_input("Symbols (comma separated)", value=st.session_state.symbols_text)
 st.session_state.symbols_text = symbols_text
 
@@ -42,34 +64,78 @@ st.session_state.window = window
 future_steps = st.sidebar.number_input("Forecast Steps (hours)", 1, 24, value=st.session_state.future_steps)
 st.session_state.future_steps = future_steps
 
+submit = st.sidebar.button("Submit")
+if submit:
+    st.session_state.submitted = True
+
+# -------------------------
+# Helper functions
+# -------------------------
+def fetch_finnhub_news(symbol: str):
+    try:
+        to_date = datetime.now().strftime("%Y-%m-%d")
+        from_date = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={from_date}&to={to_date}&token={FINNHUB_TOKEN}"
+        res = requests.get(url)
+        if res.status_code != 200:
+            return []
+        data = res.json()
+        if not isinstance(data, list) or len(data) == 0:
+            return []
+        news_entries = []
+        for item in data[:10]:
+            news_entries.append({
+                "symbol": symbol,
+                "title": item.get("headline", "N/A"),
+                "source": item.get("source", "Unknown"),
+                "published_at_str": datetime.fromtimestamp(item.get("datetime")).strftime("%Y-%m-%d %H:%M:%S"),
+                "summary": item.get("summary", ""),
+                "url": item.get("url", ""),
+                "image": item.get("image", "")
+            })
+        return news_entries
+    except Exception:
+        return []
+
+def write_news_to_bq_json(news_entries):
+    """Batch load news into BigQuery using JSON load job (free-tier safe)."""
+    if not news_entries:
+        return
+
+    client = bigquery.Client.from_service_account_json(BQ_SA_FILE, project=BQ_PROJECT)
+    table_id = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+
+    # Convert to JSON lines
+    json_lines = [json.dumps(entry, default=str) for entry in news_entries]
+    file_obj = StringIO("\n".join(json_lines))
+
+    job_config = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        autodetect=True  # optional: automatically detect schema
+    )
+
+    load_job = client.load_table_from_file(file_obj, table_id, job_config=job_config)
+    load_job.result()  # wait until finished
 
 def prep_data(prices: np.ndarray, window: int):
     if len(prices) <= window:
         return np.empty((0, window, 1)), np.empty((0, 1)), None
-
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(prices.reshape(-1,1).astype(np.float32))
     X, y = [], []
     for i in range(window, len(scaled)):
         X.append(scaled[i-window:i])
         y.append(scaled[i])
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.float32).reshape(-1, 1)
-    return X, y, scaler
-
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32).reshape(-1, 1), scaler
 
 def build_gru_model(window: int):
-    """Lightweight GRU model"""
-    model = Sequential([
-        GRU(32, return_sequences=False, input_shape=(window, 1)),
-        Dense(1)
-    ])
+    model = Sequential([GRU(32, return_sequences=False, input_shape=(window, 1)), Dense(1)])
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.005), loss='mse')
     return model
 
-
 def evaluate_model(y_true, y_pred):
-    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score # type: ignore
+    from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
     mse = mean_squared_error(y_true, y_pred)
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(y_true, y_pred)
@@ -78,66 +144,44 @@ def evaluate_model(y_true, y_pred):
     accuracy = 100 - mape
     return {"MSE": mse, "RMSE": rmse, "MAE": mae, "R2": r2, "MAPE%": mape, "Total Accuracy%": accuracy}
 
-
 @st.cache_resource(show_spinner=False)
 def train_gru(symbol: str, prices: np.ndarray, window: int, steps: int, epochs: int = 10, batch_size: int = 32):
-    """Train GRU model for multi-step forecasting"""
     if len(prices) <= window + steps:
         return None, None, None
-
     scaler = MinMaxScaler()
     scaled = scaler.fit_transform(prices.reshape(-1, 1))
-
     X, y = [], []
     for i in range(window, len(scaled) - steps):
         X.append(scaled[i - window:i])
-        y.append(scaled[i:i + steps].flatten())  # Predict next 'steps' values
-
+        y.append(scaled[i:i + steps].flatten())
     X = np.array(X, dtype=np.float32)
     y = np.array(y, dtype=np.float32)
-
-    model = Sequential([
-        GRU(64, return_sequences=False, input_shape=(window, 1)),
-        Dense(steps)
-    ])
+    model = Sequential([GRU(64, return_sequences=False, input_shape=(window, 1)), Dense(steps)])
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.003), loss='mse')
-
     es = EarlyStopping(monitor="loss", patience=2, restore_best_weights=True)
     model.fit(X, y, epochs=epochs, batch_size=batch_size, verbose=0, callbacks=[es])
-
-    # Evaluate using only the first predicted value vs actual
     y_pred = model.predict(X, verbose=0)
     y_true_inv = scaler.inverse_transform(y[:, :1])
     y_pred_inv = scaler.inverse_transform(y_pred[:, :1])
     metrics = evaluate_model(y_true_inv.flatten(), y_pred_inv.flatten())
-
     return model, scaler, metrics
 
-
 def gru_forecast(symbol: str, prices: np.ndarray, window: int, steps: int):
-    """Multi-step GRU forecast"""
     if len(prices) == 0:
         return np.array([0.0] * steps)
-
     window_use = min(window, len(prices) - steps, 2000)
     if window_use <= 0:
         return np.array([float(prices[-1])] * steps)
-
     model, scaler, metrics = train_gru(symbol, prices, window_use, steps)
     if model is None:
         return np.array([float(prices[-1])] * steps)
-
     st.session_state.metrics = st.session_state.get("metrics", {})
     st.session_state.metrics[symbol] = metrics
-
     last_seq = prices[-window_use:].reshape(-1, 1).astype(np.float32)
     scaled_seq = scaler.transform(last_seq)
     pred_scaled = model.predict(scaled_seq.reshape(1, window_use, 1), verbose=0)
     forecast = scaler.inverse_transform(pred_scaled.reshape(-1, 1)).flatten()
-
     return forecast.astype(np.float32)
-
-
 
 @st.cache_resource(show_spinner=False)
 def fetch_historical_data(symbol: str, size: int = 4000):
@@ -156,7 +200,6 @@ def fetch_historical_data(symbol: str, size: int = 4000):
     except Exception:
         return pd.DataFrame(columns=["datetime", "close"])
 
-
 def fetch_price(symbol: str):
     if not API_KEY:
         return None
@@ -166,25 +209,48 @@ def fetch_price(symbol: str):
     except Exception:
         return None
 
-
 # -------------------------
 # Main Execution
 # -------------------------
 if not API_KEY:
     st.error("API_KEY not found in .env file.")
     st.stop()
+if not FINNHUB_TOKEN:
+    st.error("FINNHUB_TOKEN not found in .env file.")
+    st.stop()
 
 symbols = [s.strip().upper() for s in st.session_state.symbols_text.split(",") if s.strip()]
 if not symbols:
-    st.info("Enter at least one ticker symbol in the sidebar.")
+    st.info("Enter at least one ticker symbol.")
     st.stop()
 
+# -------------------------
+# Only run when user hits Submit
+# -------------------------
+if not st.session_state.submitted:
+    st.info("Configure inputs and press Submit to fetch company news and display charts.")
+    st.stop()
+
+# -------------------------
+# Fetch & store company news only once
+# -------------------------
+if not st.session_state.news_fetched:
+    with st.spinner("Fetching and storing company news in BigQuery..."):
+        for sym in symbols:
+            news_data = fetch_finnhub_news(sym)
+            if news_data:
+                # Batch load JSON into BigQuery
+                write_news_to_bq_json(news_data)
+    st.session_state.news_fetched = True
+
+# -------------------------
+# Render charts for each symbol
+# -------------------------
 for symbol in symbols:
     st.header(symbol)
-
     df = fetch_historical_data(symbol)
     if df.empty:
-        st.error(f"No historical data for {symbol}. Check API key, symbol spelling, or plan limits.")
+        st.error(f"No historical data for {symbol}")
         continue
 
     latest = fetch_price(symbol)
@@ -208,7 +274,6 @@ for symbol in symbols:
         continue
 
     forecast = gru_forecast(symbol, prices, window, future_steps)
-
     plot_df = df.tail(300)
     future_time = pd.date_range(plot_df["datetime"].iloc[-1], periods=future_steps+1, freq="H")[1:]
 
